@@ -785,12 +785,13 @@ static int NCAMP;  // index NCAMP = organic
 // ---------------------------------------------------------------------------------------------
 // Global ID table: every user ID (from links, events, clicks) gets a slot. The person ID (pid)
 // of an ID is the slot index of its union-find root: for linked IDs the component's root slot,
-// for any other ID its own slot. Lock-free insert with a 16-byte CAS on the key.
+// for any other ID its own slot. Keys are the compact 8-byte IDs (see cid64); lock-free insert
+// with a 64-bit CAS on the key.
 // ---------------------------------------------------------------------------------------------
-struct alignas(32) IdSlot {
-    u64 a, b;
+struct alignas(16) IdSlot {
+    u64 k;    // 0 = empty
     u32 val;  // 0 = not yet published; otherwise pid + 1 (link phase: 1 = marker)
-    u32 pad[3];
+    u32 pad;
 };
 static IdSlot* T = nullptr;
 static u64 TMASK = 0;
@@ -798,15 +799,8 @@ static u64 TSIZE = 0;
 static const int MAXPROBE = 2048;
 static atomic<bool> g_tableFull{false};
 static vector<u64> g_inserted;  // [thread * 8]
-static Key* g_names = nullptr;  // pid -> person name for linked persons (null otherwise)
+static u64* g_names = nullptr;  // pid -> person name for linked persons (0 otherwise)
 
-// One 16-byte load instruction (atomic for aligned addresses on AVX CPUs). Written in asm so the
-// compiler cannot split it into two 8-byte loads, which could observe a half-inserted key.
-static inline __m128i load16(const void* p) {
-    __m128i v;
-    asm volatile("vmovdqa %1, %0" : "=x"(v) : "m"(*(const __m128i*)p));
-    return v;
-}
 static inline u32 waitVal(IdSlot* s) {
     u32 v;
     while ((v = __atomic_load_n(&s->val, __ATOMIC_ACQUIRE)) == 0) _mm_pause();
@@ -814,19 +808,18 @@ static inline u32 waitVal(IdSlot* s) {
 }
 // Returns the slot index; *pv receives val (pid + 1). LINK: new keys get the marker 1.
 template <bool LINK>
-static inline u32 idInsert(Key k, u64 h, int tid, u32* pv) {
+static inline u32 idInsert(u64 k, u64 h, int tid, u32* pv) {
     u64 i = h & TMASK;
     for (int probe = 0; probe < MAXPROBE;) {
         IdSlot* s = &T[i];
-        __m128i v = load16(s);
-        u64 a = (u64)_mm_cvtsi128_si64(v), b = (u64)_mm_extract_epi64(v, 1);
-        if (a == k.a && b == k.b) {
+        u64 a = __atomic_load_n(&s->k, __ATOMIC_ACQUIRE);
+        if (a == k) {
             *pv = waitVal(s);
             return (u32)i;
         }
-        if ((a | b) == 0) {
-            unsigned __int128 desired = ((unsigned __int128)k.b << 64) | k.a;
-            if (__sync_bool_compare_and_swap((unsigned __int128*)s, (unsigned __int128)0, desired)) {
+        if (a == 0) {
+            u64 expected = 0;
+            if (__atomic_compare_exchange_n(&s->k, &expected, k, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                 u32 val = LINK ? 1u : (u32)i + 1;
                 __atomic_store_n(&s->val, val, __ATOMIC_RELEASE);
                 g_inserted[tid * 8]++;
@@ -843,10 +836,9 @@ static inline u32 idInsert(Key k, u64 h, int tid, u32* pv) {
     return 0;
 }
 static inline void idPrefetch(u64 h) { __builtin_prefetch(&T[h & TMASK]); }
-static inline Key slotKey(u32 i) { return Key{T[i].a, T[i].b}; }
-static inline Key personName(u32 pid) {
-    Key n = g_names[pid];
-    return isNull(n) ? slotKey(pid) : n;
+static inline u64 personName(u32 pid) {
+    u64 n = g_names[pid];
+    return n ? n : T[pid].k;
 }
 
 static int PB = 9;  // partition bits
@@ -1055,17 +1047,16 @@ static void loadLookups() {
 // ---------------------------------------------------------------------------------------------
 static vector<Chunk> g_linkChunks;
 
-static vector<vector<Key>> g_linkPairs;  // [thread] key pairs, flattened
+static vector<vector<u64>> g_linkPairs;  // [thread] key pairs, flattened
 static size_t parseLinks() {
     auto& pairs = g_linkPairs;
     pairs.assign(NT, {});
     parallel_for(g_linkChunks.size(), [&](size_t ci, int tid) {
         auto& out = pairs[tid];
-        const char* lim = g_linkChunks[ci].lim;
         scanLines2<2>(g_linkChunks[ci].s, g_linkChunks[ci].e, g_linkChunks[ci].lim, [&](const char** fp, const u32* fl) {
             if (fl[0] && fl[1]) {
-                out.push_back(packKey<true>(fp[0], fl[0], lim, tid));
-                out.push_back(packKey<true>(fp[1], fl[1], lim, tid));
+                out.push_back(cid64(fp[0], fl[0]));
+                out.push_back(cid64(fp[1], fl[1]));
             }
         });
     });
@@ -1092,7 +1083,7 @@ static void buildLinks() {
         for (size_t base = 0; base < v.size(); base += B) {
             size_t lim = min(v.size(), base + B);
             for (size_t i = base; i < lim; i++) {
-                hs[i - base] = hk(v[i]);
+                hs[i - base] = mix64(v[i]);
                 idPrefetch(hs[i - base]);
             }
             for (size_t i = base; i < lim; i++) {
@@ -1141,15 +1132,10 @@ static void buildLinks() {
             u32 r = (u32)i;
             while (uf[r]) r = uf[r] - 1;  // read-only walk (other threads read uf too)
             s.val = r + 1;
-            Key k{s.a, s.b};
-            unsigned __int128* np = (unsigned __int128*)&g_names[r];
-            for (;;) {
-                __m128i cv = load16(np);  // a stale read only makes the CAS retry
-                Key ck{(u64)_mm_cvtsi128_si64(cv), (u64)_mm_extract_epi64(cv, 1)};
-                unsigned __int128 cur = ((unsigned __int128)ck.b << 64) | ck.a;
-                if (!isNull(ck) && !keyLess(k, ck)) break;
-                unsigned __int128 want = ((unsigned __int128)k.b << 64) | k.a;
-                if (__sync_bool_compare_and_swap(np, cur, want)) break;
+            u64 k = s.k;
+            u64 cur = __atomic_load_n(&g_names[r], __ATOMIC_RELAXED);
+            while ((cur == 0 || cidLess(k, cur)) &&
+                   !__atomic_compare_exchange_n(&g_names[r], &cur, k, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
             }
         }
     });
@@ -1165,7 +1151,8 @@ static const size_t RING = 16;  // lookup prefetch distance, in lines
 
 struct EvItem {
     ERec r;
-    Key uid, pid;
+    u64 uid;
+    Key pid;
     u64 hu, hp;
     int pcat;  // >= 0: category already known (direct product lookup); -1: use the table
 };
@@ -1222,8 +1209,8 @@ static void parseEventChunk(const Chunk& c, int tid) {
                 r.cat = 0;  // valid; resolved in flush
                 r.ts = (u32)(ts - CWS);
                 r.price = price;
-                it.uid = packKey<true>(fp[1], fl[1], lim, tid);
-                it.hu = hk(it.uid);
+                it.uid = cid64(fp[1], fl[1]);
+                it.hu = mix64(it.uid);
                 idPrefetch(it.hu);
                 int num = productNum(fp[5], fl[5]);
                 if (num >= 0) {
@@ -1243,7 +1230,7 @@ static void parseEventChunk(const Chunk& c, int tid) {
 
 struct ClItem {
     CRec r;
-    Key uid;
+    u64 uid;
     u64 hu;
 };
 
@@ -1268,11 +1255,11 @@ static void parseClickChunk(const Chunk& c, int tid) {
         if (!camp) return;
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         ClItem& it = items[nIn++ % RING];
-        it.uid = packKey<true>(fp[1], fl[1], lim, tid);
+        it.uid = cid64(fp[1], fl[1]);
         it.r.cid = cid64(fp[0], fl[0]);
         it.r.ts = (u32)(ts - CWS);
         it.r.camp = *camp;
-        it.hu = hk(it.uid);
+        it.hu = mix64(it.uid);
         idPrefetch(it.hu);
     });
     while (nOut < nIn) resolve(items[nOut++ % RING]);
@@ -1800,15 +1787,18 @@ static void writeUserFile(const string& path, const vector<URow>& rows) {
     vector<u8> def(n);
     for (size_t i = 0; i < n; i++) {
         const URow& r = rows[i];
-        Key person = personName(r.pid);
-        if (!isLong(person)) {
-            unsigned char buf[16];
-            u64 a = __builtin_bswap64(person.a), b = __builtin_bswap64(person.b);
-            memcpy(buf, &a, 8);
-            memcpy(buf + 8, &b, 8);
-            pu.str((const char*)buf, buf[15]);
+        u64 person = personName(r.pid);
+        if (!(person & SIDE_BIT)) {
+            char buf[9];
+            int len = 0;
+            for (int j = 8; j >= 0; j--) {
+                u8 c = (u8)((person >> (7 * j)) & 127);
+                if (!c) break;
+                buf[len++] = CCHAR[c];
+            }
+            pu.str(buf, (u32)len);
         } else {
-            pu.str(keyStr(person));
+            pu.str(cidStr(person));
         }
         pd.i32(r.day);
         ps.i32((int32_t)r.sessions);
@@ -1936,7 +1926,7 @@ int main(int argc, char** argv) {
     if (TSIZE > (1ull << 31)) die("ID table too large");
     TMASK = TSIZE - 1;
     T = (IdSlot*)g_arena.alloc(TSIZE * sizeof(IdSlot));
-    g_names = (Key*)g_arena.alloc(TSIZE * sizeof(Key));
+    g_names = (u64*)g_arena.alloc(TSIZE * sizeof(u64));
     buildLinks();
     checkTable();
     logt("links");
