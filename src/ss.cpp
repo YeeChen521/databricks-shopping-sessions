@@ -42,6 +42,9 @@
 #include <unistd.h>
 
 using namespace std;
+#ifdef SS_GCOV
+extern "C" void __gcov_dump(void);
+#endif
 typedef int64_t i64;
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -117,7 +120,7 @@ struct Arena {
 static Arena g_arena;
 
 static const size_t SLAB = 4u << 20;
-static const size_t BLK = 16u << 10;
+static const size_t BLK = 8u << 10;
 struct Slab {
     char* p = nullptr;
     char* e = nullptr;
@@ -527,6 +530,93 @@ static inline bool splitLine(const char* s, const char* e, const char** fp, u32*
     return i == N;
 }
 
+// Line-at-a-time scanner (same contract as scanLines). For a line of at most 126 bytes, the
+// 128 bytes at its start give comma / quote / newline bitmasks; the field count is one popcount
+// and quoting is validated for the whole line with a few 128-bit operations:
+//   field starts S = (C << 1) | 1, field ends E = T >> 1 with terminators T = C | bit(L);
+//   start quotes Qs = Q & S, end quotes Qe = Q & E. Valid iff every quote is a start or an end
+//   quote, no quote is both (a lone `"` field), and each start quote's field ends with a quote:
+//   adding Qs to the non-terminator bits M carries from a field's start to its terminator, so
+//   ((M + Qs) & T) >> 1 is exactly the set of required end quotes.
+// Longer lines use the scalar splitter.
+typedef unsigned __int128 u128;
+static inline int ctz128(u128 x) {
+    u64 lo = (u64)x;
+    return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll((u64)(x >> 64));
+}
+static inline int popc128(u128 x) { return __builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64)); }
+
+template <int N, class F>
+static inline void scanLines2(const char* s, const char* e, const char* lim, F&& onLine) {
+    const char* fp[N];
+    u32 fl[N];
+    alignas(64) char tmp[128];
+    while (s < e) {
+        const char* base = s;
+        if (s + 128 > lim) {
+            memset(tmp, 0, 128);
+            memcpy(tmp, s, (size_t)(lim - s));
+            base = tmp;
+        }
+        u64 nl0, cm0, qt0, nl1, cm1, qt1;
+        blockMasks(base, nl0, cm0, qt0);
+        blockMasks(base + 64, nl1, cm1, qt1);
+        u128 NL = (u128)nl0 | ((u128)nl1 << 64);
+        size_t rem = (size_t)(e - s);
+        if (rem < 128) NL &= ((u128)1 << rem) - 1;
+        u32 L;
+        const char* next;
+        if (NL) {
+            L = (u32)ctz128(NL);
+            next = s + L + 1;
+        } else if (rem < 128) {
+            L = (u32)rem;  // last line, no '\n'
+            next = e;
+        } else {
+            L = 1000;  // long line
+            next = nullptr;
+        }
+        if (L > 126) {
+            const char* nlp = (const char*)memchr(s, '\n', rem);
+            const char* le = nlp ? nlp : e;
+            if (splitLine<N>(s, le, fp, fl)) onLine(fp, fl);
+            s = nlp ? nlp + 1 : e;
+            continue;
+        }
+        const char* ls = s;
+        s = next;
+        if (L == 0) continue;  // empty line
+        u128 lm = ((u128)1 << L) - 1;
+        u128 C = ((u128)cm0 | ((u128)cm1 << 64)) & lm;
+        if (popc128(C) != N - 1) continue;
+        u128 Q = ((u128)qt0 | ((u128)qt1 << 64)) & lm;
+        u128 Qs = 0;
+        if (Q) {
+            u128 T = C | ((u128)1 << L);
+            Qs = Q & ((C << 1) | 1);
+            u128 Qe = Q & (T >> 1);
+            if ((Q & ~(Qs | Qe)) | (Qs & Qe)) continue;
+            u128 M = ~T & (((u128)1 << (L + 1)) - 1);
+            if (Qe != (((M + Qs) & T) >> 1)) continue;
+        }
+        u32 a = 0;
+        for (int i = 0; i < N; i++) {
+            u32 b;
+            if (i < N - 1) {
+                b = (u32)ctz128(C);
+                C &= C - 1;
+            } else {
+                b = L;
+            }
+            u32 q = (u32)(Qs >> a) & 1;
+            fp[i] = ls + a + q;
+            fl[i] = b - a - 2 * q;
+            a = b + 1;
+        }
+        onLine(fp, fl);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Timestamps
 // ---------------------------------------------------------------------------------------------
@@ -671,6 +761,20 @@ static i64 DAY0;          // floor(WS / DAY)
 static int NDAYS;
 
 static KeyMap<u16> g_products;
+// Product IDs of the form p<digits> (no leading zero, value < 2^20) are looked up in a small
+// direct array instead of the hash table; every other ID uses the table. Exact either way.
+static vector<u16> g_catByNum;  // number -> category; NOCAT = not in products.csv
+static const u16 NOCAT = 0xFFFE;
+static inline int productNum(const char* p, u32 n) {
+    if (n < 2 || n > 7 || p[0] != 'p' || p[1] < '1' || p[1] > '9') return -1;
+    int v = 0;
+    for (u32 i = 1; i < n; i++) {
+        unsigned d = (unsigned char)p[i] - '0';
+        if (d > 9) return -1;
+        v = v * 10 + (int)d;
+    }
+    return v;  // < 10^6 < 2^20
+}
 static vector<string> g_catNames;
 static vector<int> g_catRank;
 static int g_unknownCat;
@@ -907,10 +1011,21 @@ static void loadLookups() {
         g_unknownCat = it->second;
     if (g_catNames.size() > 60000) die("too many categories");
     g_products.initArena(prods.size() + 1);
+    int maxNum = -1;
+    vector<pair<int, u16>> direct;
     for (auto& pr : prods) {
-        bool ins;
-        g_products.insert(pr.first, pr.second, ins);
+        string id = keyStr(pr.first);
+        int num = productNum(id.data(), (u32)id.size());
+        if (num >= 0) {
+            direct.emplace_back(num, pr.second);
+            maxNum = max(maxNum, num);
+        } else {
+            bool ins;
+            g_products.insert(pr.first, pr.second, ins);
+        }
     }
+    g_catByNum.assign((size_t)(maxNum + 1), NOCAT);
+    for (auto& d : direct) g_catByNum[d.first] = d.second;
     vector<int> order(g_catNames.size());
     for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
     sort(order.begin(), order.end(), [](int a, int b) { return g_catNames[a] < g_catNames[b]; });
@@ -947,7 +1062,7 @@ static size_t parseLinks() {
     parallel_for(g_linkChunks.size(), [&](size_t ci, int tid) {
         auto& out = pairs[tid];
         const char* lim = g_linkChunks[ci].lim;
-        scanLines<2>(g_linkChunks[ci].s, g_linkChunks[ci].e, [&](const char** fp, const u32* fl) {
+        scanLines2<2>(g_linkChunks[ci].s, g_linkChunks[ci].e, g_linkChunks[ci].lim, [&](const char** fp, const u32* fl) {
             if (fl[0] && fl[1]) {
                 out.push_back(packKey<true>(fp[0], fl[0], lim, tid));
                 out.push_back(packKey<true>(fp[1], fl[1], lim, tid));
@@ -1052,6 +1167,7 @@ struct EvItem {
     ERec r;
     Key uid, pid;
     u64 hu, hp;
+    int pcat;  // >= 0: category already known (direct product lookup); -1: use the table
 };
 
 static void parseEventChunk(const Chunk& c, int tid) {
@@ -1066,12 +1182,16 @@ static void parseEventChunk(const Chunk& c, int tid) {
             u32 pv;
             idInsert<false>(it.uid, it.hu, tid, &pv);
             it.r.pid = pv - 1;
-            const u16* cat = g_products.findH(it.pid, it.hp);
-            it.r.cat = cat ? *cat : (u16)g_unknownCat;
+            if (it.pcat >= 0) {
+                it.r.cat = (u16)it.pcat;
+            } else {
+                const u16* cat = g_products.findH(it.pid, it.hp);
+                it.r.cat = cat ? *cat : (u16)g_unknownCat;
+            }
         }
         out[partOf(mix64(it.r.eid))].push(it.r, slab);
     };
-    scanLines<7>(c.s, c.e, [&](const char** fp, const u32* fl) {
+    scanLines2<7>(c.s, c.e, c.lim, [&](const char** fp, const u32* fl) {
         if (fl[0] == 0) return;
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         EvItem& it = items[nIn++ % RING];
@@ -1103,11 +1223,18 @@ static void parseEventChunk(const Chunk& c, int tid) {
                 r.ts = (u32)(ts - CWS);
                 r.price = price;
                 it.uid = packKey<true>(fp[1], fl[1], lim, tid);
-                it.pid = packKey<false>(fp[5], fl[5], lim, tid);
                 it.hu = hk(it.uid);
-                it.hp = hk(it.pid);
                 idPrefetch(it.hu);
-                g_products.prefetchH(it.hp);
+                int num = productNum(fp[5], fl[5]);
+                if (num >= 0) {
+                    u16 c = (size_t)num < g_catByNum.size() ? g_catByNum[num] : NOCAT;
+                    it.pcat = c == NOCAT ? g_unknownCat : c;
+                } else {
+                    it.pcat = -1;
+                    it.pid = packKey<false>(fp[5], fl[5], lim, tid);
+                    it.hp = hk(it.pid);
+                    g_products.prefetchH(it.hp);
+                }
             }
         }
     });
@@ -1133,7 +1260,7 @@ static void parseClickChunk(const Chunk& c, int tid) {
         it.r.pid = pv - 1;
         out[it.r.pid & pmask].push(it.r, slab);
     };
-    scanLines<4>(c.s, c.e, [&](const char** fp, const u32* fl) {
+    scanLines2<4>(c.s, c.e, c.lim, [&](const char** fp, const u32* fl) {
         if (fl[0] == 0 || fl[1] == 0 || fl[2] == 0) return;
         i64 ts;
         if (!parseTs(fp[3], fl[3], ts) || ts < CWS || ts >= WE) return;
@@ -1740,7 +1867,7 @@ static void mkdirs(const string& p) {
 }
 
 // ---------------------------------------------------------------------------------------------
-#ifndef SS_TSTEST
+#if !defined(SS_TSTEST) && !defined(SS_SCANTEST) && !defined(SS_BENCH)
 int main(int argc, char** argv) {
     const char* v;
     DATA = (v = getenv("DATA_DIR")) ? v : "/data";
@@ -1803,7 +1930,7 @@ int main(int argc, char** argv) {
     // single-ID people). Sized for load <= ~2/3; a re-exec with a bigger table covers misses.
     double est = 0.7 * (double)linkKeys + 0.02 * ((double)evBytes / 80.0) + 0.005 * ((double)clBytes / 45.0);
     TSIZE = 1u << 16;
-    while ((double)TSIZE < est * 1.5) TSIZE <<= 1;
+    while ((double)TSIZE < est * 1.2) TSIZE <<= 1;
     TSIZE <<= tscale;
     if ((v = getenv("SS_TSHRINK"))) TSIZE = max<u64>(64, TSIZE >> atoi(v));  // test hook: undersize
     if (TSIZE > (1ull << 31)) die("ID table too large");
@@ -1873,7 +2000,24 @@ int main(int argc, char** argv) {
         order[q] = {n, q};
     }
     sort(order.begin(), order.end(), greater<>());
-    parallel_for(NQ, [&](size_t i, int tid) { personPartition(order[i].second, tid); });
+    {
+        atomic<u64> maxNs{0};
+        vector<u64> busy(NT * 8, 0);
+        parallel_for(NQ, [&](size_t i, int tid) {
+            auto t0 = chrono::steady_clock::now();
+            personPartition(order[i].second, tid);
+            u64 ns = (u64)chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now() - t0).count();
+            busy[tid * 8] += ns;
+            u64 m = maxNs.load();
+            while (ns > m && !maxNs.compare_exchange_weak(m, ns)) {}
+        });
+        if (VERBOSE) {
+            u64 tot = 0;
+            for (int t = 0; t < NT; t++) tot += busy[t * 8];
+            fprintf(stderr, "person stage: max partition %.1f ms, mean busy per thread %.1f ms, biggest partition %zu events\n",
+                    maxNs.load() / 1e6, tot / 1e6 / NT, order[0].first);
+        }
+    }
     logt("sessions+attribution");
 
     mkdirs(OUT);
@@ -1900,7 +2044,73 @@ int main(int argc, char** argv) {
     }
     fflush(stdout);
     fflush(stderr);
+#ifdef SS_GCOV
+    __gcov_dump();  // profile-guided-optimization training build: _exit skips the normal dump
+#endif
     _exit(0);
+}
+#elif defined(SS_BENCH)
+// Bench: scanner cost alone over every events file, mode 1 = old block scanner, 2 = line scanner,
+// 3 = line scanner + timestamp parse + compact event id.
+int main(int argc, char** argv) {
+    NT = 8;
+    initMasks();
+    initCompact();
+    int mode = atoi(argv[2]);
+    vector<string> paths = listCsv(string(argv[1]) + "/events");
+    vector<MFile> files;
+    for (auto& p : paths) files.push_back(mapFile(p));
+    vector<Chunk> ch;
+    makeChunks(files, 2 << 20, ch);
+    for (auto& c : ch) for (const char* q = c.s; q < c.e; q += 4096) (void)*(volatile const char*)q;
+    atomic<u64> acc{0};
+    auto t0 = chrono::steady_clock::now();
+    parallel_for(ch.size(), [&](size_t i, int) {
+        u64 x = 0;
+        auto cb = [&](const char** fp, const u32* fl) {
+            x += fl[0] + fl[6];
+            if (mode == 3) {
+                i64 t;
+                if (parseTs(fp[2], fl[2], t)) x += (u64)t;
+                if (parseTs(fp[3], fl[3], t)) x += (u64)t;
+                x += cid64(fp[0], fl[0]);
+            }
+        };
+        if (mode == 1) scanLines<7>(ch[i].s, ch[i].e, cb); else scanLines2<7>(ch[i].s, ch[i].e, ch[i].lim, cb);
+        acc += x;
+    });
+    printf("mode %d: %.3f s (%llu)\n", mode, chrono::duration<double>(chrono::steady_clock::now() - t0).count(), (unsigned long long)acc.load());
+    return 0;
+}
+#elif defined(SS_SCANTEST)
+// Test driver: compares scanLines2<4> with the scalar splitter on every line of a file.
+int main(int argc, char** argv) {
+    string d = readSmall(argv[1]);
+    vector<string> a, b;
+    const char* s = d.data();
+    const char* e = s + d.size();
+    scanLines2<4>(s, e, e, [&](const char** fp, const u32* fl) {
+        string r;
+        for (int i = 0; i < 4; i++) r += "[" + string(fp[i], fl[i]) + "]";
+        a.push_back(r);
+    });
+    const char* p = s;
+    while (p < e) {
+        const char* nl = (const char*)memchr(p, '\n', e - p);
+        const char* le = nl ? nl : e;
+        const char* fp[4];
+        u32 fl[4];
+        if (splitLine<4>(p, le, fp, fl)) {
+            string r;
+            for (int i = 0; i < 4; i++) r += "[" + string(fp[i], fl[i]) + "]";
+            b.push_back(r);
+        }
+        p = nl ? nl + 1 : e;
+    }
+    size_t bad = a.size() != b.size();
+    for (size_t i = 0; i < min(a.size(), b.size()); i++) bad += a[i] != b[i];
+    printf("scanLines2 %zu lines, splitLine %zu lines, mismatches %zu\n", a.size(), b.size(), bad);
+    return bad ? 1 : 0;
 }
 #else
 // Test driver: one timestamp per line on stdin -> "BAD" or the parsed epoch ms.
