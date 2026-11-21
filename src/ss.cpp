@@ -1949,22 +1949,14 @@ int main(int argc, char** argv) {
         }
     };
 
-    // Chunks are computed without touching file data. A background thread asks the kernel to read
-    // every chunk ahead, in processing order (links, events, clicks), so a cold page cache is
-    // filled with large asynchronous reads while the lookups and links are being built.
+    // Chunks are computed without touching file data. Each parse worker asks the kernel to read
+    // ahead its own chunk and the one a round later, with no extra thread competing for disk or CPU.
     size_t chunkLk = 256 << 10, chunkEv = 2 << 20;
     if ((v = getenv("SS_CHUNK"))) chunkLk = chunkEv = (size_t)max(1, atoi(v));  // test hook: tiny chunks
     makeChunks(lkFiles, chunkLk, g_linkChunks);
     vector<Chunk> evChunks, clChunks;
     makeChunks(evFiles, chunkEv, evChunks);
     makeChunks(clFiles, chunkEv, clChunks);
-    thread readahead([&]() {
-        for (auto* cs : {&g_linkChunks, &evChunks, &clChunks})
-            for (auto& c : *cs) {
-                uintptr_t a = (uintptr_t)c.s & ~(uintptr_t)4095;
-                madvise((void*)a, (uintptr_t)c.e - a, MADV_WILLNEED);
-            }
-    });
     loadManifest();
     loadLookups();
     logt("lookups");
@@ -1992,12 +1984,20 @@ int main(int argc, char** argv) {
     vector<Chunk> all(evChunks);
     all.insert(all.end(), clChunks.begin(), clChunks.end());
     bool populate = !getenv("SS_NOPOPULATE");
+    auto willneed = [&](size_t i) {
+        if (i >= all.size()) return;
+        uintptr_t a = (uintptr_t)all[i].s & ~(uintptr_t)4095;
+        madvise((void*)a, (uintptr_t)all[i].e - a, MADV_WILLNEED);
+    };
     parallel_for(all.size(), [&](size_t i, int tid) {
         if (populate) {
             // map this chunk's page-cache pages in one call instead of one fault per 4 KB page
             uintptr_t a = (uintptr_t)all[i].s & ~(uintptr_t)4095;
-            madvise((void*)a, (uintptr_t)all[i].e - a, 22 /* MADV_POPULATE_READ */);
+            if (madvise((void*)a, (uintptr_t)all[i].e - a, 22 /* MADV_POPULATE_READ */) != 0) willneed(i);
+        } else {
+            willneed(i);
         }
+        willneed(i + NT);
         if (i < nE)
             parseEventChunk(all[i], tid);
         else
@@ -2005,7 +2005,6 @@ int main(int argc, char** argv) {
     });
     checkTable();
     mergeLongs();
-    readahead.join();
     for (auto* fs : {&evFiles, &clFiles, &lkFiles})
         for (auto& f : *fs)
             if (f.n) munmap((void*)f.p, f.n);
