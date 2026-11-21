@@ -390,30 +390,36 @@ static string readSmall(const string& path) {
     return s;
 }
 
+// A chunk is a raw byte range of one file; it owns exactly the lines that START inside it.
+// makeChunks never reads file data (no page faults on the main thread); each worker calls
+// snapChunk to move s to the first line start in the range (past the header in the file's first
+// chunk) and e to the end of the line containing e - 1. Adjacent chunks therefore agree.
 struct Chunk {
-    const char* s;    // first byte of the first line
-    const char* e;    // one past the last byte (after a '\n', or the file end)
-    const char* lim;  // end of the mapped file
+    const char* s;
+    const char* e;
+    const char* lim;   // end of the mapped file
+    const char* base;  // start of the mapped file
 };
 static void makeChunks(const vector<MFile>& files, size_t target, vector<Chunk>& out) {
     for (auto& f : files) {
         if (f.n == 0) continue;
         const char* end = f.p + f.n;
-        const char* h = (const char*)memchr(f.p, '\n', f.n);
-        if (!h) continue;  // header only, no newline
-        const char* s = h + 1;
-        while (s < end) {
-            const char* e = s + target;
-            if (e >= end) {
-                e = end;
-            } else {
-                const char* nl = (const char*)memchr(e, '\n', end - e);
-                e = nl ? nl + 1 : end;
-            }
-            out.push_back(Chunk{s, e, end});
-            s = e;
-        }
+        for (const char* s = f.p; s < end; s += target) out.push_back(Chunk{s, min(end, s + target), end, f.p});
     }
+}
+static inline void snapChunk(Chunk& c) {
+    const char* s = c.s;
+    if (s == c.base || s[-1] != '\n') {
+        const char* h = (const char*)memchr(s, '\n', (size_t)(c.lim - s));
+        s = h ? h + 1 : c.lim;
+    }
+    const char* e = c.e;
+    if (e < c.lim && e[-1] != '\n') {
+        const char* h = (const char*)memchr(e, '\n', (size_t)(c.lim - e));
+        e = h ? h + 1 : c.lim;
+    }
+    c.s = s;
+    c.e = e < s ? s : e;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -872,7 +878,7 @@ static u64 sideId(const char* p, size_t n) {
     if (it.second) g_sideStr.emplace_back(p, n);
     return it.first->second;
 }
-static inline u64 cid64(const char* p, size_t n) {
+static inline u64 cid64(const char* p, size_t n) {  // scalar reference / fallback
     if (n <= 9) {
         u64 v = 0;
         size_t i = 0;
@@ -884,6 +890,30 @@ static inline u64 cid64(const char* p, size_t n) {
         if (i == n) return v << (7 * (9 - n));
     }
     return sideId(p, n);
+}
+// SIMD version of cid64: byte ranges -> 7-bit codes, one validity check, bswap + pext to pack.
+// Needs 16 readable bytes at p (p + 16 <= lim); otherwise uses the scalar version.
+static inline u64 cid64f(const char* p, size_t n, const char* lim) {
+    if (n > 9 || p + 16 > lim) return cid64(p, n);
+    __m128i v = _mm_loadu_si128((const __m128i*)p);
+    // signed byte compares: bytes >= 0x80 are negative and fall outside every range
+    auto inRange = [&](char lo, char hi) {
+        return _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8((char)(lo - 1))), _mm_cmplt_epi8(v, _mm_set1_epi8((char)(hi + 1))));
+    };
+    __m128i dig = inRange('0', '9'), up = inRange('A', 'Z'), low = inRange('a', 'z');
+    __m128i dash = _mm_cmpeq_epi8(v, _mm_set1_epi8('-')), und = _mm_cmpeq_epi8(v, _mm_set1_epi8('_'));
+    // code = byte - offset: '-'->1, '0'..'9'->2..11, 'A'..'Z'->12..37, '_'->38, 'a'..'z'->39..64
+    __m128i off = _mm_or_si128(
+        _mm_or_si128(_mm_and_si128(dig, _mm_set1_epi8(0x2E)), _mm_and_si128(up, _mm_set1_epi8(0x35))),
+        _mm_or_si128(_mm_or_si128(_mm_and_si128(low, _mm_set1_epi8(0x3A)), _mm_and_si128(dash, _mm_set1_epi8(0x2C))),
+                     _mm_and_si128(und, _mm_set1_epi8(0x5F - 38))));
+    __m128i ok = _mm_or_si128(_mm_or_si128(dig, up), _mm_or_si128(low, _mm_or_si128(dash, und)));
+    u32 lenMask = (1u << n) - 1;
+    if (((u32)_mm_movemask_epi8(ok) & lenMask) != lenMask) return sideId(p, n);
+    __m128i code = _mm_and_si128(_mm_sub_epi8(v, off), _mm_load_si128((const __m128i*)MASK16[n]));
+    u64 lo = (u64)_mm_cvtsi128_si64(code);                   // codes 0..7 (code 0 in the lowest byte)
+    u64 c8 = (u64)_mm_extract_epi8(code, 8);                  // code 8
+    return (_pext_u64(__builtin_bswap64(lo), 0x7F7F7F7F7F7F7F7FULL) << 7) | c8;
 }
 static string cidStr(u64 v) {
     if (v & SIDE_BIT) {
@@ -1053,10 +1083,12 @@ static size_t parseLinks() {
     pairs.assign(NT, {});
     parallel_for(g_linkChunks.size(), [&](size_t ci, int tid) {
         auto& out = pairs[tid];
-        scanLines2<2>(g_linkChunks[ci].s, g_linkChunks[ci].e, g_linkChunks[ci].lim, [&](const char** fp, const u32* fl) {
+        Chunk c = g_linkChunks[ci];
+        snapChunk(c);
+        scanLines2<2>(c.s, c.e, c.lim, [&](const char** fp, const u32* fl) {
             if (fl[0] && fl[1]) {
-                out.push_back(cid64(fp[0], fl[0]));
-                out.push_back(cid64(fp[1], fl[1]));
+                out.push_back(cid64f(fp[0], fl[0], c.lim));
+                out.push_back(cid64f(fp[1], fl[1], c.lim));
             }
         });
     });
@@ -1157,7 +1189,8 @@ struct EvItem {
     int pcat;  // >= 0: category already known (direct product lookup); -1: use the table
 };
 
-static void parseEventChunk(const Chunk& c, int tid) {
+static void parseEventChunk(Chunk c, int tid) {
+    snapChunk(c);
     auto& out = evBuf[tid];
     Slab& slab = g_slabs[tid];
     const char* lim = c.lim;
@@ -1183,7 +1216,7 @@ static void parseEventChunk(const Chunk& c, int tid) {
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         EvItem& it = items[nIn++ % RING];
         ERec& r = it.r;
-        r.eid = cid64(fp[0], fl[0]);
+        r.eid = cid64f(fp[0], fl[0], lim);
         i64 ing;
         if (parseTs(fp[3], fl[3], ing)) {
             i64 s = fdiv(ing, 1000) - CWS / 1000;
@@ -1209,7 +1242,7 @@ static void parseEventChunk(const Chunk& c, int tid) {
                 r.cat = 0;  // valid; resolved in flush
                 r.ts = (u32)(ts - CWS);
                 r.price = price;
-                it.uid = cid64(fp[1], fl[1]);
+                it.uid = cid64f(fp[1], fl[1], lim);
                 it.hu = mix64(it.uid);
                 idPrefetch(it.hu);
                 int num = productNum(fp[5], fl[5]);
@@ -1234,7 +1267,8 @@ struct ClItem {
     u64 hu;
 };
 
-static void parseClickChunk(const Chunk& c, int tid) {
+static void parseClickChunk(Chunk c, int tid) {
+    snapChunk(c);
     auto& out = clBuf[tid];
     Slab& slab = g_slabs[tid];
     const char* lim = c.lim;
@@ -1255,8 +1289,8 @@ static void parseClickChunk(const Chunk& c, int tid) {
         if (!camp) return;
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         ClItem& it = items[nIn++ % RING];
-        it.uid = cid64(fp[1], fl[1]);
-        it.r.cid = cid64(fp[0], fl[0]);
+        it.uid = cid64f(fp[1], fl[1], lim);
+        it.r.cid = cid64f(fp[0], fl[0], lim);
         it.r.ts = (u32)(ts - CWS);
         it.r.camp = *camp;
         it.hu = mix64(it.uid);
@@ -1857,7 +1891,7 @@ static void mkdirs(const string& p) {
 }
 
 // ---------------------------------------------------------------------------------------------
-#if !defined(SS_TSTEST) && !defined(SS_SCANTEST) && !defined(SS_BENCH)
+#if !defined(SS_TSTEST) && !defined(SS_SCANTEST) && !defined(SS_BENCH) && !defined(SS_CIDTEST)
 int main(int argc, char** argv) {
     const char* v;
     DATA = (v = getenv("DATA_DIR")) ? v : "/data";
@@ -1910,10 +1944,25 @@ int main(int argc, char** argv) {
         }
     };
 
+    // Chunks are computed without touching file data. A background thread asks the kernel to read
+    // every chunk ahead, in processing order (links, events, clicks), so a cold page cache is
+    // filled with large asynchronous reads while the lookups and links are being built.
+    size_t chunkLk = 256 << 10, chunkEv = 2 << 20;
+    if ((v = getenv("SS_CHUNK"))) chunkLk = chunkEv = (size_t)max(1, atoi(v));  // test hook: tiny chunks
+    makeChunks(lkFiles, chunkLk, g_linkChunks);
+    vector<Chunk> evChunks, clChunks;
+    makeChunks(evFiles, chunkEv, evChunks);
+    makeChunks(clFiles, chunkEv, clChunks);
+    thread readahead([&]() {
+        for (auto* cs : {&g_linkChunks, &evChunks, &clChunks})
+            for (auto& c : *cs) {
+                uintptr_t a = (uintptr_t)c.s & ~(uintptr_t)4095;
+                madvise((void*)a, (uintptr_t)c.e - a, MADV_WILLNEED);
+            }
+    });
     loadManifest();
     loadLookups();
     logt("lookups");
-    makeChunks(lkFiles, 256 << 10, g_linkChunks);
     size_t linkKeys = parseLinks();
     logt("links parse");
     // ID table: distinct IDs ~ 60% of link key occurrences + ~1.5% of event rows (the generator's
@@ -1929,9 +1978,6 @@ int main(int argc, char** argv) {
     checkTable();
     logt("links");
 
-    vector<Chunk> evChunks, clChunks;
-    makeChunks(evFiles, 2 << 20, evChunks);
-    makeChunks(clFiles, 2 << 20, clChunks);
     evBuf.assign(NT, vector<Stream<ERec>>(NP));
     clBuf.assign(NT, vector<Stream<CRec>>(NQ));
     sBuf.assign(NT, vector<Stream<SRec>>(NQ));
@@ -1940,23 +1986,13 @@ int main(int argc, char** argv) {
     size_t nE = evChunks.size();
     vector<Chunk> all(evChunks);
     all.insert(all.end(), clChunks.begin(), clChunks.end());
-    // Ask the kernel to read ahead this chunk and the one a round later, in one request each,
-    // so a cold page cache is filled with large parallel reads instead of 128 KB fault windows.
     bool populate = !getenv("SS_NOPOPULATE");
-    auto willneed = [&](size_t i) {
-        if (i >= all.size()) return;
-        uintptr_t a = (uintptr_t)all[i].s & ~(uintptr_t)4095;
-        madvise((void*)a, (uintptr_t)all[i].e - a, MADV_WILLNEED);
-    };
     parallel_for(all.size(), [&](size_t i, int tid) {
         if (populate) {
             // map this chunk's page-cache pages in one call instead of one fault per 4 KB page
             uintptr_t a = (uintptr_t)all[i].s & ~(uintptr_t)4095;
-            if (madvise((void*)a, (uintptr_t)all[i].e - a, 22 /* MADV_POPULATE_READ */) != 0) willneed(i);
-        } else {
-            willneed(i);
+            madvise((void*)a, (uintptr_t)all[i].e - a, 22 /* MADV_POPULATE_READ */);
         }
-        willneed(i + NT);
         if (i < nE)
             parseEventChunk(all[i], tid);
         else
@@ -1964,6 +2000,7 @@ int main(int argc, char** argv) {
     });
     checkTable();
     mergeLongs();
+    readahead.join();
     for (auto* fs : {&evFiles, &clFiles, &lkFiles})
         for (auto& f : *fs)
             if (f.n) munmap((void*)f.p, f.n);
@@ -2037,11 +2074,32 @@ int main(int argc, char** argv) {
 #endif
     _exit(0);
 }
+#elif defined(SS_CIDTEST)
+// Test driver: SIMD compact-ID encoder vs the scalar one on random strings.
+int main() {
+    initMasks();
+    initCompact();
+    u64 rng = 88172645463325252ULL;
+    auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    const char pool[] = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz,./@[`{ \x7f\x80\xff\t";
+    vector<char> buf(64);
+    long bad = 0, n = 0;
+    for (int it = 0; it < 3000000; it++) {
+        size_t len = 1 + rnd() % 12, at = rnd() % 32;
+        for (auto& c : buf) c = pool[rnd() % (sizeof(pool) - 1)];
+        if (rnd() % 4) for (size_t i = 0; i < len; i++) buf[at + i] = pool[rnd() % 64];  // mostly valid
+        u64 a = cid64(buf.data() + at, len), b = cid64f(buf.data() + at, len, buf.data() + 64);
+        n++;
+        if (a != b && ++bad < 5) printf("mismatch len %zu: %llx vs %llx\n", len, (unsigned long long)a, (unsigned long long)b);
+    }
+    printf("%ld cases, %ld mismatches\n", n, bad);
+    return bad != 0;
+}
 #elif defined(SS_BENCH)
 // Bench: scanner cost alone over every events file, mode 1 = old block scanner, 2 = line scanner,
 // 3 = line scanner + timestamp parse + compact event id.
 int main(int argc, char** argv) {
-    NT = 8;
+    NT = argc > 3 ? atoi(argv[3]) : 8;
     initMasks();
     initCompact();
     int mode = atoi(argv[2]);
@@ -2057,14 +2115,22 @@ int main(int argc, char** argv) {
         u64 x = 0;
         auto cb = [&](const char** fp, const u32* fl) {
             x += fl[0] + fl[6];
-            if (mode == 3) {
+            if (mode >= 3) {
                 i64 t;
-                if (parseTs(fp[2], fl[2], t)) x += (u64)t;
-                if (parseTs(fp[3], fl[3], t)) x += (u64)t;
-                x += cid64(fp[0], fl[0]);
+                if (mode != 5 && parseTs(fp[2], fl[2], t)) x += (u64)t;
+                if (mode != 5 && parseTs(fp[3], fl[3], t)) x += (u64)t;
+                if (mode != 6) x += cid64f(fp[0], fl[0], ch[i].lim);
+            }
+            if (mode >= 4) {
+                x += cid64f(fp[1], fl[1], ch[i].lim);
+                x += productNum(fp[5], fl[5]);
+                u32 pr;
+                if (fl[4] == 8 && parsePrice(fp[6], fl[6], pr)) x += pr;
             }
         };
-        if (mode == 1) scanLines<7>(ch[i].s, ch[i].e, cb); else scanLines2<7>(ch[i].s, ch[i].e, ch[i].lim, cb);
+        Chunk c = ch[i];
+        snapChunk(c);
+        if (mode == 1) scanLines<7>(c.s, c.e, cb); else scanLines2<7>(c.s, c.e, c.lim, cb);
         acc += x;
     });
     printf("mode %d: %.3f s (%llu)\n", mode, chrono::duration<double>(chrono::steady_clock::now() - t0).count(), (unsigned long long)acc.load());
