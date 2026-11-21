@@ -46,6 +46,9 @@ Key techniques:
   are dropped as `rules.md` says. Input is `mmap`ed and split into 2 MB chunks aligned to newlines,
   and each file's header line is skipped. `madvise(WILLNEED)` reads ahead the current chunk and the
   one a round later, which helps when the page cache is cold.
+- **Compact 8-byte event/click IDs:** IDs of up to 9 characters from `[-0-9A-Z_a-z]` are packed 7 bits per
+  character in byte order (exact; integer order = string order). Anything else gets an exact id from a
+  side table. Event copies shrink to 28 bytes and clicks to 20.
 - **Exact 16-byte keys:** an ID of up to 15 bytes is packed big-endian with its length in the last
   byte. Keys are then exact, and comparing them as integers gives byte-wise string order, which the
   names and the `click_id` tie-break need. A longer ID gets a 120-bit hash plus a side table of
@@ -58,7 +61,7 @@ Key techniques:
   estimate is ever badly wrong, the process re-execs itself with a bigger table: slower, still
   correct.
 - **Timestamps:** the F1/F2 forms are validated with SWAR (all digit and separator checks in a few
-  64-bit operations), then converted with a branch-light civil-date calculation. F3 accepts any
+  64-bit operations); validated dates are cached per thread, and F3 digits are converted 8 at a time. F3 accepts any
   number of leading zeros, and values too big for int64 fall outside the window.
 - **Memory:** a huge-page arena feeds per-thread slabs and append-only block streams, so buffers are
   never reallocated. Consumed event blocks are reused for the survivor streams. Lookups into the ID
@@ -80,7 +83,7 @@ scorer's Xeon will differ; only the leaderboard's times count.
 | Dataset | In-process (min / median) | Container wall, scorer flags |
 | --- | --- | --- |
 | 1M events (dev) | ~0.1 s | 0.62–0.68 s (≈ Docker Desktop overhead, ~0.6 s for an empty run) |
-| 20M events / 5M clicks | 1.04 / 1.12 s | 1.79–1.94 s |
+| 20M events / 5M clicks | 0.82 / 0.88 s | 1.43–1.63 s |
 | 40M events / 10M clicks | 2.41 / 2.83 s | 3.3–4.0 s |
 
 At 20M, the first correct native version (v1) ran in ~2.6–3.0 s in-process, and the DuckDB reference

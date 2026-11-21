@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -574,17 +575,34 @@ static inline bool parseTs(const char* p, u32 n, i64& out) {
             return false;
         u64 ta = A ^ 0x3030303030303030ULL, tb = B ^ 0x3030303030303030ULL;
         u32 tc = C ^ 0x30303030u;
-        int y = dgt(ta, 0) * 1000 + dgt(ta, 1) * 100 + dgt(ta, 2) * 10 + dgt(ta, 3);
-        int mo = dgt(ta, 5) * 10 + dgt(ta, 6);
-        int d = dgt(tb, 0) * 10 + dgt(tb, 1);
         int h = dgt(tb, 3) * 10 + dgt(tb, 4);
         int mi = dgt(tb, 6) * 10 + dgt(tb, 7);
         int se = (int)((tc >> 8) & 0xFF) * 10 + (int)((tc >> 16) & 0xFF);
-        if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59) return false;
-        int md = MDAYS[mo];
-        if (mo == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) md = 29;
-        if (d > md) return false;
-        i64 t = daysFromCivil(y, mo, d) * DAY + (i64)h * 3600000 + (i64)mi * 60000 + (i64)se * 1000;
+        if (h > 23 || mi > 59 || se > 59) return false;
+        // date part "YYYY-MM-DD": a few distinct values per dataset, so validated days are cached
+        struct DateCache {
+            u64 a;
+            u32 d2;
+            i32 days;
+        };
+        static thread_local DateCache dc[64];
+        u32 d2 = (u32)(B & 0xFFFF);
+        DateCache& c = dc[(mix64(A ^ ((u64)d2 << 48)) >> 58)];
+        i64 days;
+        if (c.a == A && c.d2 == d2 && c.d2 != 0) {
+            days = c.days;
+        } else {
+            int y = dgt(ta, 0) * 1000 + dgt(ta, 1) * 100 + dgt(ta, 2) * 10 + dgt(ta, 3);
+            int mo = dgt(ta, 5) * 10 + dgt(ta, 6);
+            int d = dgt(tb, 0) * 10 + dgt(tb, 1);
+            if (mo < 1 || mo > 12 || d < 1) return false;
+            int md = MDAYS[mo];
+            if (mo == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) md = 29;
+            if (d > md) return false;
+            days = daysFromCivil(y, mo, d);
+            c = DateCache{A, d2, (i32)days};
+        }
+        i64 t = days * DAY + (i64)h * 3600000 + (i64)mi * 60000 + (i64)se * 1000;
         char z = p[19];
         if (n == 20) {
             if (z != 'Z') return false;
@@ -596,6 +614,21 @@ static inline bool parseTs(const char* p, u32 n, i64& out) {
             t -= z == '+' ? off : -off;
         }
         out = t;
+        return true;
+    }
+    if (n >= 9 && n <= 16) {
+        // SWAR: last 8 digits + up to 8 leading ones; the first digit sits in the lowest byte
+        u64 lo = ld8(p + n - 8), hi = ld8(p) << (8 * (16 - n));  // hi keeps only the first n-8 bytes
+        hi |= n == 16 ? 0 : (0x3030303030303030ULL >> (8 * (n - 8)));  // missing leading digits = '0'
+        if (nonDigits(lo, ~0ull) | nonDigits(hi, ~0ull)) return false;
+        auto conv8 = [](u64 v) {
+            v ^= 0x3030303030303030ULL;
+            v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FFULL;
+            v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFFULL;
+            return (v * 10000 + (v >> 32)) & 0xFFFFFFFFULL;
+        };
+        u64 hv = conv8(hi);
+        out = (i64)(hv * 100000000ULL + conv8(lo));
         return true;
     }
     u32 i = 0;
@@ -718,8 +751,65 @@ static int QB = 7;  // person partition bits (coarser than the event partitions)
 static int NQ = 1 << 7;
 static inline int partOf(u64 h) { return (int)(h >> (64 - PB)); }
 
+// ---------------------------------------------------------------------------------------------
+// Compact 64-bit IDs for event_id / click_id. Up to 9 characters from [-0-9A-Z_a-z] are packed
+// 7 bits each, left-aligned, with codes in byte order and 0 as padding: exact, and integer order
+// is byte-wise string order. Any other ID gets an exact number from a side table (top bit set);
+// comparing those falls back to the strings.
+// ---------------------------------------------------------------------------------------------
+static u8 CCODE[256];   // byte -> 1..64, 0 = not in the alphabet
+static char CCHAR[65];  // code -> byte
+static void initCompact() {
+    const char* alpha = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";  // byte order
+    for (int i = 0; i < 64; i++) {
+        CCODE[(u8)alpha[i]] = (u8)(i + 1);
+        CCHAR[i + 1] = alpha[i];
+    }
+}
+static const u64 SIDE_BIT = 1ull << 63;
+static mutex g_sideMu;
+static unordered_map<string, u64> g_sideId;
+static vector<string> g_sideStr;
+static u64 sideId(const char* p, size_t n) {
+    lock_guard<mutex> g(g_sideMu);
+    auto it = g_sideId.emplace(string(p, n), SIDE_BIT | g_sideStr.size());
+    if (it.second) g_sideStr.emplace_back(p, n);
+    return it.first->second;
+}
+static inline u64 cid64(const char* p, size_t n) {
+    if (n <= 9) {
+        u64 v = 0;
+        size_t i = 0;
+        for (; i < n; i++) {
+            u8 c = CCODE[(u8)p[i]];
+            if (!c) break;
+            v = (v << 7) | c;
+        }
+        if (i == n) return v << (7 * (9 - n));
+    }
+    return sideId(p, n);
+}
+static string cidStr(u64 v) {
+    if (v & SIDE_BIT) {
+        lock_guard<mutex> g(g_sideMu);
+        return g_sideStr[v & ~SIDE_BIT];
+    }
+    string s;
+    for (int i = 8; i >= 0; i--) {
+        u8 c = (u8)((v >> (7 * i)) & 127);
+        if (!c) break;
+        s.push_back(CCHAR[c]);
+    }
+    return s;
+}
+static inline bool cidLess(u64 a, u64 b) {
+    if (!((a | b) & SIDE_BIT)) return a < b;
+    return cidStr(a) < cidStr(b);
+}
+
+#pragma pack(push, 4)
 struct ERec {  // event copy, partitioned by event_id
-    Key eid;
+    u64 eid;
     u32 pid;
     u32 ts;
     i32 ing;  // seconds relative to CWS
@@ -734,15 +824,15 @@ struct SRec {  // surviving event, partitioned by pid
     u32 cat;
 };
 struct CRec {  // valid click, partitioned by pid
-    Key cid;
+    u64 cid;
     u32 pid;
     u32 ts;
     u32 camp;
-    u32 pad;
 };
-static_assert(sizeof(ERec) == 40, "ERec");
+#pragma pack(pop)
+static_assert(sizeof(ERec) == 28, "ERec");
 static_assert(sizeof(SRec) == 16, "SRec");
-static_assert(sizeof(CRec) == 32, "CRec");
+static_assert(sizeof(CRec) == 20, "CRec");
 
 // ---------------------------------------------------------------------------------------------
 // Lookups
@@ -979,14 +1069,14 @@ static void parseEventChunk(const Chunk& c, int tid) {
             const u16* cat = g_products.findH(it.pid, it.hp);
             it.r.cat = cat ? *cat : (u16)g_unknownCat;
         }
-        out[partOf(hk(it.r.eid))].push(it.r, slab);
+        out[partOf(mix64(it.r.eid))].push(it.r, slab);
     };
     scanLines<7>(c.s, c.e, [&](const char** fp, const u32* fl) {
         if (fl[0] == 0) return;
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         EvItem& it = items[nIn++ % RING];
         ERec& r = it.r;
-        r.eid = packKey<false>(fp[0], fl[0], lim, tid);
+        r.eid = cid64(fp[0], fl[0]);
         i64 ing;
         if (parseTs(fp[3], fl[3], ing)) {
             i64 s = fdiv(ing, 1000) - CWS / 1000;
@@ -1052,10 +1142,9 @@ static void parseClickChunk(const Chunk& c, int tid) {
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         ClItem& it = items[nIn++ % RING];
         it.uid = packKey<true>(fp[1], fl[1], lim, tid);
-        it.r.cid = packKey<true>(fp[0], fl[0], lim, tid);
+        it.r.cid = cid64(fp[0], fl[0]);
         it.r.ts = (u32)(ts - CWS);
         it.r.camp = *camp;
-        it.r.pad = 0;
         it.hu = hk(it.uid);
         idPrefetch(it.hu);
     });
@@ -1068,8 +1157,9 @@ static void parseClickChunk(const Chunk& c, int tid) {
 static vector<vector<Stream<SRec>>> sBuf;  // [thread][person partition]
 // The table holds the current winner's payload, so records are read once and the output is a
 // sequential scan of the table.
-struct DedupSlot {
-    Key k;
+#pragma pack(push, 4)
+struct DedupSlot {  // k == 0: empty (a compact ID is never 0)
+    u64 k;
     i32 ing;
     u32 pid;
     u32 ts;
@@ -1077,7 +1167,8 @@ struct DedupSlot {
     u16 cat;
     u16 pad;
 };
-static_assert(sizeof(DedupSlot) == 40, "DedupSlot");
+#pragma pack(pop)
+static_assert(sizeof(DedupSlot) == 28, "DedupSlot");
 static vector<vector<DedupSlot>> g_dedupTab;  // [thread]
 
 static void dedupPartition(int p, int tid) {
@@ -1095,14 +1186,14 @@ static void dedupPartition(int p, int tid) {
     u64 hs[Stream<ERec>::CAP];
     for (int t = 0; t < NT; t++) {
         evBuf[t][p].eachBlock([&](const ERec* rs, size_t cnt) {
-            for (size_t j = 0; j < cnt; j++) hs[j] = hk(rs[j].eid);
+            for (size_t j = 0; j < cnt; j++) hs[j] = mix64(rs[j].eid);
             for (size_t j = 0; j < cnt; j++) {
                 if (j + PF < cnt) __builtin_prefetch(&tab[hs[j + PF] & mask]);
                 const ERec& r = rs[j];
                 u64 i = hs[j] & mask;
                 for (;;) {
                     DedupSlot& x = tab[i];
-                    if (isNull(x.k)) {
+                    if (x.k == 0) {
                         x = DedupSlot{r.eid, r.ing, r.pid, r.ts, r.price, r.cat, 0};
                         break;
                     }
@@ -1121,7 +1212,7 @@ static void dedupPartition(int p, int tid) {
     const u32 pmask = (u32)NQ - 1;
     for (size_t i = 0; i < sz; i++) {
         const DedupSlot& x = tab[i];
-        if (x.cat != INVALID_CAT && !isNull(x.k)) out[x.pid & pmask].push(SRec{x.pid, x.ts, x.price, x.cat}, slab);
+        if (x.cat != INVALID_CAT && x.k != 0) out[x.pid & pmask].push(SRec{x.pid, x.ts, x.price, x.cat}, slab);
     }
 }
 
@@ -1151,7 +1242,7 @@ struct PEv {
 struct PCl {
     u32 ts;
     u32 camp;
-    Key cid;
+    u64 cid;
 };
 
 // LSD radix sort by ts (11 + 11 + 10 bits), stable; for persons with many events.
@@ -1325,7 +1416,7 @@ static void personPartition(int q, int tid) {
         if (m > 1) {
             sort(c, c + m, [](const PCl& a, const PCl& b) {
                 if (a.ts != b.ts) return a.ts < b.ts;
-                return keyLess(b.cid, a.cid);  // click_id descending: last = smallest
+                return cidLess(b.cid, a.cid);  // click_id descending: last = smallest
             });
         }
         sDayEnd.resize(S);
@@ -1669,6 +1760,7 @@ int main(int argc, char** argv) {
     g_slabs.assign(NT, Slab{});
     g_inserted.assign((size_t)NT * 8, 0);
     initMasks();
+    initCompact();
 
     // inputs
     vector<string> evPaths = listCsv(DATA + "/events"), clPaths = listCsv(DATA + "/clicks"),
@@ -1735,13 +1827,20 @@ int main(int argc, char** argv) {
     all.insert(all.end(), clChunks.begin(), clChunks.end());
     // Ask the kernel to read ahead this chunk and the one a round later, in one request each,
     // so a cold page cache is filled with large parallel reads instead of 128 KB fault windows.
+    bool populate = !getenv("SS_NOPOPULATE");
     auto willneed = [&](size_t i) {
         if (i >= all.size()) return;
         uintptr_t a = (uintptr_t)all[i].s & ~(uintptr_t)4095;
         madvise((void*)a, (uintptr_t)all[i].e - a, MADV_WILLNEED);
     };
     parallel_for(all.size(), [&](size_t i, int tid) {
-        willneed(i);
+        if (populate) {
+            // map this chunk's page-cache pages in one call instead of one fault per 4 KB page
+            uintptr_t a = (uintptr_t)all[i].s & ~(uintptr_t)4095;
+            if (madvise((void*)a, (uintptr_t)all[i].e - a, 22 /* MADV_POPULATE_READ */) != 0) willneed(i);
+        } else {
+            willneed(i);
+        }
         willneed(i + NT);
         if (i < nE)
             parseEventChunk(all[i], tid);
