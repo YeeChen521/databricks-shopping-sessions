@@ -1,0 +1,10 @@
+# local datasets, outputs, builds and environments
+data/
+out/
+build/
+.venv/
+dev/
+dev-answer/
+__pycache__/
+*.pyc
+perf.data*

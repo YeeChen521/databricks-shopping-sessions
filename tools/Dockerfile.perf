@@ -1,0 +1,2 @@
+FROM ss-dev
+RUN apt-get update -qq && apt-get install -y -qq linux-perf >/dev/null && rm -rf /var/lib/apt/lists/*; ls /usr/bin/perf* /usr/lib/linux-tools*/ 2>/dev/null || true
