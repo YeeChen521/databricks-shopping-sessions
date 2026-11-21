@@ -1376,11 +1376,13 @@ struct URow {
     i32 topcat;  // -1 = null
     u32 pad;
 };
-struct CampAgg {
-    i64 sessions, purch, revenue, assisted;
+struct CampAgg {  // credited sessions per (campaign, day), per thread
+    u32 sessions, purch;
+    i64 revenue;
 };
 static vector<vector<URow>> uRows;
 static vector<vector<CampAgg>> campAgg;
+static vector<vector<u32>> campAssist;  // assisted sessions per (campaign, day), per thread (dense: stays in L2)
 
 struct PEv {
     u32 ts;
@@ -1464,6 +1466,7 @@ static void personPartition(int q, int tid) {
     }
     auto& rows = uRows[tid];
     auto& agg = campAgg[tid];
+    auto& assist = campAssist[tid];
     auto& catRev = sc.catRev;
     auto& touched = sc.catTouched;
     auto& campCnt = sc.campCnt;
@@ -1574,7 +1577,7 @@ static void personPartition(int q, int tid) {
         auto addInterval = [&](u32 cp, size_t a, size_t b) {
             while (a < b) {
                 size_t e2 = min<size_t>(b, sDayEnd[a]);
-                agg[(size_t)cp * NDAYS + sDay[a]].assisted += (i64)(e2 - a);
+                assist[(size_t)cp * NDAYS + sDay[a]] += (u32)(e2 - a);
                 a = e2;
             }
         };
@@ -1862,13 +1865,15 @@ static void writeCampaignFile(const string& path) {
     i64 n = 0;
     for (int cp = 0; cp <= NCAMP; cp++) {
         for (int di = 0; di < NDAYS; di++) {
-            CampAgg a{0, 0, 0, 0};
+            struct {
+                i64 sessions, purch, revenue, assisted;
+            } a{0, 0, 0, 0};
             for (int t = 0; t < NT; t++) {
                 const CampAgg& x = campAgg[t][(size_t)cp * NDAYS + di];
                 a.sessions += x.sessions;
                 a.purch += x.purch;
                 a.revenue += x.revenue;
-                a.assisted += x.assisted;
+                a.assisted += campAssist[t][(size_t)cp * NDAYS + di];
             }
             if (a.sessions == 0 && a.assisted == 0) continue;
             pc.str(cp == NCAMP ? string("organic") : g_campNames[cp]);
@@ -2011,7 +2016,8 @@ int main(int argc, char** argv) {
     logt("dedup");
 
     uRows.assign(NT, {});
-    campAgg.assign(NT, vector<CampAgg>((size_t)(NCAMP + 1) * NDAYS, CampAgg{0, 0, 0, 0}));
+    campAgg.assign(NT, vector<CampAgg>((size_t)(NCAMP + 1) * NDAYS, CampAgg{0, 0, 0}));
+    campAssist.assign(NT, vector<u32>((size_t)(NCAMP + 1) * NDAYS, 0));
     scratch.resize(NT);
     for (auto& s : scratch) {
         s.catRev.assign(g_catNames.size(), 0);
@@ -2025,39 +2031,33 @@ int main(int argc, char** argv) {
         order[q] = {n, q};
     }
     sort(order.begin(), order.end(), greater<>());
-    {
-        atomic<u64> maxNs{0};
-        vector<u64> busy(NT * 8, 0);
-        parallel_for(NQ, [&](size_t i, int tid) {
-            auto t0 = chrono::steady_clock::now();
-            personPartition(order[i].second, tid);
-            u64 ns = (u64)chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now() - t0).count();
-            busy[tid * 8] += ns;
-            u64 m = maxNs.load();
-            while (ns > m && !maxNs.compare_exchange_weak(m, ns)) {}
-        });
-        if (VERBOSE) {
-            u64 tot = 0;
-            for (int t = 0; t < NT; t++) tot += busy[t * 8];
-            fprintf(stderr, "person stage: max partition %.1f ms, mean busy per thread %.1f ms, biggest partition %zu events\n",
-                    maxNs.load() / 1e6, tot / 1e6 / NT, order[0].first);
-        }
-    }
-    logt("sessions+attribution");
-
+    // Each worker writes its own user_daily file as soon as no partitions are left for it, so
+    // writing overlaps the other workers' last partitions. campaign_daily needs every worker's
+    // counters and is written after the join.
     mkdirs(OUT);
     mkdirs(OUT + "/user_daily");
     mkdirs(OUT + "/campaign_daily");
     atomic<int> written{0};
-    parallel_for(NT + 1, [&](size_t t, int) {
-        if (t == (size_t)NT) {
-            writeCampaignFile(OUT + "/campaign_daily/part-0.parquet");
-            return;
-        }
-        if (uRows[t].empty()) return;
-        writeUserFile(OUT + "/user_daily/part-" + to_string(t) + ".parquet", uRows[t]);
-        written++;
-    });
+    {
+        atomic<size_t> next{0};
+        auto work = [&](int tid) {
+            for (;;) {
+                size_t i = next.fetch_add(1, memory_order_relaxed);
+                if (i >= (size_t)NQ) break;
+                personPartition(order[i].second, tid);
+            }
+            if (!uRows[tid].empty()) {
+                writeUserFile(OUT + "/user_daily/part-" + to_string(tid) + ".parquet", uRows[tid]);
+                written++;
+            }
+        };
+        vector<thread> th;
+        for (int t = 1; t < NT; t++) th.emplace_back(work, t);
+        work(0);
+        for (auto& x : th) x.join();
+    }
+    logt("sessions+attribution+user_daily");
+    writeCampaignFile(OUT + "/campaign_daily/part-0.parquet");
     if (written == 0) writeUserFile(OUT + "/user_daily/part-0.parquet", {});
     logt("write");
     if (VERBOSE) {
