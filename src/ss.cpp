@@ -794,8 +794,8 @@ struct alignas(16) IdSlot {
     u32 pad;
 };
 static IdSlot* T = nullptr;
-static u64 TMASK = 0;
 static u64 TSIZE = 0;
+static inline u64 tslot(u64 h) { return (u64)(((unsigned __int128)h * TSIZE) >> 64); }  // h -> [0, TSIZE)
 static const int MAXPROBE = 2048;
 static atomic<bool> g_tableFull{false};
 static vector<u64> g_inserted;  // [thread * 8]
@@ -809,7 +809,7 @@ static inline u32 waitVal(IdSlot* s) {
 // Returns the slot index; *pv receives val (pid + 1). LINK: new keys get the marker 1.
 template <bool LINK>
 static inline u32 idInsert(u64 k, u64 h, int tid, u32* pv) {
-    u64 i = h & TMASK;
+    u64 i = tslot(h);
     for (int probe = 0; probe < MAXPROBE;) {
         IdSlot* s = &T[i];
         u64 a = __atomic_load_n(&s->k, __ATOMIC_ACQUIRE);
@@ -828,14 +828,14 @@ static inline u32 idInsert(u64 k, u64 h, int tid, u32* pv) {
             }
             continue;  // lost the race for this slot: look at it again
         }
-        i = (i + 1) & TMASK;
+        if (++i == TSIZE) i = 0;
         probe++;
     }
     g_tableFull.store(true, memory_order_relaxed);
     *pv = 1;
     return 0;
 }
-static inline void idPrefetch(u64 h) { __builtin_prefetch(&T[h & TMASK]); }
+static inline void idPrefetch(u64 h) { __builtin_prefetch(&T[tslot(h)]); }
 static inline u64 personName(u32 pid) {
     u64 n = g_names[pid];
     return n ? n : T[pid].k;
@@ -1919,12 +1919,10 @@ int main(int argc, char** argv) {
     // ID table: distinct IDs ~ 60% of link key occurrences + ~1.5% of event rows (the generator's
     // single-ID people). Sized for load <= ~2/3; a re-exec with a bigger table covers misses.
     double est = 0.7 * (double)linkKeys + 0.02 * ((double)evBytes / 80.0) + 0.005 * ((double)clBytes / 45.0);
-    TSIZE = 1u << 16;
-    while ((double)TSIZE < est * 1.2) TSIZE <<= 1;
-    TSIZE <<= tscale;
+    // Any size works (slot = multiply-high of the hash), so the load is set directly: ~0.55.
+    TSIZE = max<u64>(1u << 16, (u64)(est * 1.5)) << tscale;
     if ((v = getenv("SS_TSHRINK"))) TSIZE = max<u64>(64, TSIZE >> atoi(v));  // test hook: undersize
     if (TSIZE > (1ull << 31)) die("ID table too large");
-    TMASK = TSIZE - 1;
     T = (IdSlot*)g_arena.alloc(TSIZE * sizeof(IdSlot));
     g_names = (u64*)g_arena.alloc(TSIZE * sizeof(u64));
     buildLinks();
