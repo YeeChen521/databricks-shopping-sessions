@@ -527,6 +527,113 @@ static inline bool splitLine(const char* s, const char* e, const char** fp, u32*
     return i == N;
 }
 
+// Line-at-a-time scanner (same contract as scanLines). For a line of at most 126 bytes, the
+// 128 bytes at its start give comma / quote / newline bitmasks; the field count is one popcount
+// and quoting is validated for the whole line with a few 128-bit operations:
+//   field starts S = (C << 1) | 1, field ends E = T >> 1 with terminators T = C | bit(L);
+//   start quotes Qs = Q & S, end quotes Qe = Q & E. Valid iff every quote is a start or an end
+//   quote, no quote is both (a lone `"` field), and each start quote's field ends with a quote:
+//   adding Qs to the non-terminator bits M carries from a field's start to its terminator, so
+//   ((M + Qs) & T) >> 1 is exactly the set of required end quotes.
+// Longer lines use the scalar splitter.
+typedef unsigned __int128 u128;
+static inline int ctz128(u128 x) {
+    u64 lo = (u64)x;
+    return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll((u64)(x >> 64));
+}
+static inline int popc128(u128 x) { return __builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64)); }
+
+// Per-line masks for a line starting at s. Returns false for a long line (> 126 bytes).
+struct LineM {
+    u128 C, Q;
+    u32 L;
+    const char* next;
+};
+static inline bool lineMasks(const char*& s, const char* e, const char* lim, char* tmp, LineM& m) {
+    const char* base = s;
+    if (s + 128 > lim) {
+        memset(tmp, 0, 128);
+        memcpy(tmp, s, (size_t)(lim - s));
+        base = tmp;
+    }
+    u64 nl0, cm0, qt0, nl1, cm1, qt1;
+    blockMasks(base, nl0, cm0, qt0);
+    blockMasks(base + 64, nl1, cm1, qt1);
+    u128 NL = (u128)nl0 | ((u128)nl1 << 64);
+    size_t rem = (size_t)(e - s);
+    if (rem < 128) NL &= ((u128)1 << rem) - 1;
+    if (NL) {
+        m.L = (u32)ctz128(NL);
+        m.next = s + m.L + 1;
+    } else if (rem < 128) {
+        m.L = (u32)rem;
+        m.next = e;
+    } else {
+        return false;
+    }
+    if (m.L > 126) return false;
+    u128 lm = ((u128)1 << m.L) - 1;
+    m.C = ((u128)cm0 | ((u128)cm1 << 64)) & lm;
+    m.Q = ((u128)qt0 | ((u128)qt1 << 64)) & lm;
+    return true;
+}
+// quote validation; returns false if malformed, sets Qs (start quotes)
+static inline bool quotesOk(const LineM& m, u128& Qs) {
+    Qs = 0;
+    if (!m.Q) return true;
+    u128 T = m.C | ((u128)1 << m.L);
+    Qs = m.Q & ((m.C << 1) | 1);
+    u128 Qe = m.Q & (T >> 1);
+    if ((m.Q & ~(Qs | Qe)) | (Qs & Qe)) return false;
+    u128 M = ~T & (((u128)1 << (m.L + 1)) - 1);
+    return Qe == (((M + Qs) & T) >> 1);
+}
+
+template <int N, class F>
+static inline void scanLines2(const char* s, const char* e, const char* lim, F&& onLine) {
+    const char* fp[N];
+    u32 fl[N];
+    alignas(64) char tmp[128];
+    while (s < e) {
+        LineM m;
+        const char* ls = s;
+        if (!lineMasks(s, e, lim, tmp, m)) {
+            const char* nlp = (const char*)memchr(s, '\n', (size_t)(e - s));
+            const char* le = nlp ? nlp : e;
+            if (splitLine<N>(s, le, fp, fl)) onLine(fp, fl);
+            s = nlp ? nlp + 1 : e;
+            continue;
+        }
+        s = m.next;
+        if (m.L == 0) continue;
+        if (popc128(m.C) != N - 1) continue;
+        u128 Qs;
+        if (!quotesOk(m, Qs)) continue;
+        // comma positions without branches: tzcnt of the low word, else 64 + tzcnt of the high word
+        u64 lo = (u64)m.C, hi = (u64)(m.C >> 64);
+        u64 qlo = (u64)Qs, qhi = (u64)(Qs >> 64);
+        u32 a = 0;
+        for (int i = 0; i < N; i++) {
+            u32 b;
+            if (i < N - 1) {
+                u32 tl = (u32)_tzcnt_u64(lo), th = 64 + (u32)_tzcnt_u64(hi);
+                b = lo ? tl : th;
+                u64 nlo = _blsr_u64(lo), nhi = _blsr_u64(hi);
+                hi = lo ? hi : nhi;
+                lo = nlo;
+            } else {
+                b = m.L;
+            }
+            u32 q = (u32)((a < 64 ? qlo >> (a & 63) : qhi >> (a & 63)) & 1);
+            fp[i] = ls + a + q;
+            fl[i] = b - a - 2 * q;
+            a = b + 1;
+        }
+        onLine(fp, fl);
+    }
+}
+
+
 // ---------------------------------------------------------------------------------------------
 // Timestamps
 // ---------------------------------------------------------------------------------------------
@@ -660,6 +767,56 @@ static inline bool parsePrice(const char* p, u32 n, u32& out) {
     return true;
 }
 
+// F1 "YYYY-MM-DDTHH:MM:SSZ" (n == 20) in SSE. Returns true only for a valid F1 timestamp, with
+// exactly parseTs's result; false means "not handled here" (the caller then uses parseTs).
+// Needs 20 readable bytes at p.
+static inline bool tsF1(const char* p, i64& out) {
+    __m128i v = _mm_loadu_si128((const __m128i*)p);
+    u32 w;
+    memcpy(&w, p + 16, 4);  // ":SSZ"
+    __m128i t = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+    __m128i isDig = _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t);
+    __m128i isSep = _mm_cmpeq_epi8(v, _mm_setr_epi8(0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0));
+    u32 ok = ((u32)_mm_movemask_epi8(isDig) & 0xDB6Fu) | ((u32)_mm_movemask_epi8(isSep) & 0x2490u);
+    u32 s1 = ((w >> 8) & 0xFF) - '0', s2 = ((w >> 16) & 0xFF) - '0';
+    if (ok != 0xFFFFu || (w & 0xFF0000FFu) != (((u32)'Z' << 24) | ':') || s1 > 5 || s2 > 9) return false;
+    // digits -> [YH, YL, MO, DD, HH, MI] as 16-bit lanes
+    __m128i g = _mm_shuffle_epi8(t, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+    __m128i d16 = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+    // HH <= 23, MI <= 59 (month and day are checked on a date-cache miss)
+    if (_mm_movemask_epi8(_mm_cmpgt_epi16(d16, _mm_setr_epi16(99, 99, 99, 99, 23, 59, 0, 0)))) return false;
+    __m128i d32 = _mm_madd_epi16(d16, _mm_setr_epi16(100, 1, 100, 1, 60, 1, 0, 0));  // [year, mo*100+dd, minutes]
+    u32 year = (u32)_mm_cvtsi128_si32(d32);
+    u32 md = (u32)_mm_extract_epi32(d32, 1);
+    u32 mins = (u32)_mm_extract_epi32(d32, 2);
+    struct DC {
+        u32 key;
+        i32 days;
+    };
+    static thread_local DC dc[256];
+    u32 key = year * 10000 + md + 1;  // exact (md < 10000); + 1: never 0 (the empty marker)
+    DC& c = dc[(key * 2654435761u) >> 24];
+    i64 days;
+    if (c.key == key) {
+        days = c.days;
+    } else {
+        int mo = (int)(md / 100), d = (int)(md % 100), y = (int)year;
+        if (mo < 1 || mo > 12 || d < 1) return false;
+        int mdays = MDAYS[mo];
+        if (mo == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) mdays = 29;
+        if (d > mdays) return false;
+        days = daysFromCivil(y, mo, d);
+        c = DC{key, (i32)days};
+    }
+    out = days * DAY + (i64)(mins * 60 + s1 * 10 + s2) * 1000;
+    return true;
+}
+static inline bool parseTsF(const char* p, u32 n, i64& out) {
+    if (n == 20 && tsF1(p, out)) return true;
+    return parseTs(p, n, out);
+}
+
+
 // ---------------------------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------------------------
@@ -789,6 +946,28 @@ static inline u64 cid64(const char* p, size_t n) {
     }
     return sideId(p, n);
 }
+// SIMD compact ID (same encoding as cid64; needs p + 16 <= lim, else the scalar one).
+static inline u64 cid64f(const char* p, size_t n, const char* lim) {
+    if (n > 9 || p + 16 > lim) return cid64(p, n);
+    __m128i v = _mm_loadu_si128((const __m128i*)p);
+    auto inRange = [&](char lo, char hi) {
+        return _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8((char)(lo - 1))), _mm_cmplt_epi8(v, _mm_set1_epi8((char)(hi + 1))));
+    };
+    __m128i dig = inRange('0', '9'), up = inRange('A', 'Z'), low = inRange('a', 'z');
+    __m128i dash = _mm_cmpeq_epi8(v, _mm_set1_epi8('-')), und = _mm_cmpeq_epi8(v, _mm_set1_epi8('_'));
+    __m128i off = _mm_or_si128(
+        _mm_or_si128(_mm_and_si128(dig, _mm_set1_epi8(0x2E)), _mm_and_si128(up, _mm_set1_epi8(0x35))),
+        _mm_or_si128(_mm_or_si128(_mm_and_si128(low, _mm_set1_epi8(0x3A)), _mm_and_si128(dash, _mm_set1_epi8(0x2C))),
+                     _mm_and_si128(und, _mm_set1_epi8(0x5F - 38))));
+    __m128i ok = _mm_or_si128(_mm_or_si128(dig, up), _mm_or_si128(low, _mm_or_si128(dash, und)));
+    u32 lenMask = (1u << n) - 1;
+    if (((u32)_mm_movemask_epi8(ok) & lenMask) != lenMask) return sideId(p, n);
+    __m128i code = _mm_and_si128(_mm_sub_epi8(v, off), _mm_load_si128((const __m128i*)MASK16[n]));
+    u64 lo = (u64)_mm_cvtsi128_si64(code);
+    u64 c8 = (u64)_mm_extract_epi8(code, 8);
+    return (_pext_u64(__builtin_bswap64(lo), 0x7F7F7F7F7F7F7F7FULL) << 7) | c8;
+}
+
 static string cidStr(u64 v) {
     if (v & SIDE_BIT) {
         lock_guard<mutex> g(g_sideMu);
@@ -947,7 +1126,7 @@ static size_t parseLinks() {
     parallel_for(g_linkChunks.size(), [&](size_t ci, int tid) {
         auto& out = pairs[tid];
         const char* lim = g_linkChunks[ci].lim;
-        scanLines<2>(g_linkChunks[ci].s, g_linkChunks[ci].e, [&](const char** fp, const u32* fl) {
+        scanLines2<2>(g_linkChunks[ci].s, g_linkChunks[ci].e, lim, [&](const char** fp, const u32* fl) {
             if (fl[0] && fl[1]) {
                 out.push_back(packKey<true>(fp[0], fl[0], lim, tid));
                 out.push_back(packKey<true>(fp[1], fl[1], lim, tid));
@@ -1071,14 +1250,14 @@ static void parseEventChunk(const Chunk& c, int tid) {
         }
         out[partOf(mix64(it.r.eid))].push(it.r, slab);
     };
-    scanLines<7>(c.s, c.e, [&](const char** fp, const u32* fl) {
+    scanLines2<7>(c.s, c.e, lim, [&](const char** fp, const u32* fl) {
         if (fl[0] == 0) return;
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         EvItem& it = items[nIn++ % RING];
         ERec& r = it.r;
-        r.eid = cid64(fp[0], fl[0]);
+        r.eid = cid64f(fp[0], fl[0], lim);
         i64 ing;
-        if (parseTs(fp[3], fl[3], ing)) {
+        if (parseTsF(fp[3], fl[3], ing)) {
             i64 s = fdiv(ing, 1000) - CWS / 1000;
             r.ing = s > INT32_MAX ? INT32_MAX : s < INT32_MIN ? INT32_MIN : (i32)s;
         } else {
@@ -1091,12 +1270,17 @@ static void parseEventChunk(const Chunk& c, int tid) {
         r.price = 0;
         r.pad = 0;
         i64 ts;
-        if (fl[1] != 0 && fl[5] != 0 && parseTs(fp[2], fl[2], ts) && ts >= WS && ts < WE) {
+        if (fl[1] != 0 && fl[5] != 0 && parseTsF(fp[2], fl[2], ts) && ts >= WS && ts < WE) {
             int typ = -1;
             if (fl[4] == 4) {
-                if (memcmp(fp[4], "view", 4) == 0 || memcmp(fp[4], "cart", 4) == 0) typ = 0;
-            } else if (fl[4] == 8 && memcmp(fp[4], "purchase", 8) == 0)
-                typ = 1;
+                u32 x;
+                memcpy(&x, fp[4], 4);
+                if (x == 0x77656976u /* view */ || x == 0x74726163u /* cart */) typ = 0;
+            } else if (fl[4] == 8) {
+                u64 x;
+                memcpy(&x, fp[4], 8);
+                if (x == 0x6573616863727570ull /* purchase */) typ = 1;
+            }
             u32 price = 0;
             if (typ >= 0 && (typ == 0 || parsePrice(fp[6], fl[6], price)) && !(ing - ts > DAY)) {
                 r.cat = 0;  // valid; resolved in flush
@@ -1133,16 +1317,16 @@ static void parseClickChunk(const Chunk& c, int tid) {
         it.r.pid = pv - 1;
         out[it.r.pid & pmask].push(it.r, slab);
     };
-    scanLines<4>(c.s, c.e, [&](const char** fp, const u32* fl) {
+    scanLines2<4>(c.s, c.e, lim, [&](const char** fp, const u32* fl) {
         if (fl[0] == 0 || fl[1] == 0 || fl[2] == 0) return;
         i64 ts;
-        if (!parseTs(fp[3], fl[3], ts) || ts < CWS || ts >= WE) return;
+        if (!parseTsF(fp[3], fl[3], ts) || ts < CWS || ts >= WE) return;
         const u32* camp = g_campaigns.find(packKey<false>(fp[2], fl[2], lim, tid));
         if (!camp) return;
         if (nIn - nOut == RING) resolve(items[nOut++ % RING]);
         ClItem& it = items[nIn++ % RING];
         it.uid = packKey<true>(fp[1], fl[1], lim, tid);
-        it.r.cid = cid64(fp[0], fl[0]);
+        it.r.cid = cid64f(fp[0], fl[0], lim);
         it.r.ts = (u32)(ts - CWS);
         it.r.camp = *camp;
         it.hu = hk(it.uid);
@@ -1740,7 +1924,7 @@ static void mkdirs(const string& p) {
 }
 
 // ---------------------------------------------------------------------------------------------
-#ifndef SS_TSTEST
+#if !defined(SS_TSTEST) && !defined(SS_NOMAIN)
 int main(int argc, char** argv) {
     const char* v;
     DATA = (v = getenv("DATA_DIR")) ? v : "/data";
@@ -1902,7 +2086,7 @@ int main(int argc, char** argv) {
     fflush(stderr);
     _exit(0);
 }
-#else
+#elif defined(SS_TSTEST)
 // Test driver: one timestamp per line on stdin -> "BAD" or the parsed epoch ms.
 int main() {
     char buf[1 << 16];
@@ -1910,7 +2094,7 @@ int main() {
         size_t n = strlen(buf);
         if (n && buf[n - 1] == '\n') buf[--n] = 0;
         i64 t;
-        if (parseTs(buf, (u32)n, t))
+        if (parseTsF(buf, (u32)n, t))  // the fast path, falling back to parseTs
             printf("%lld\n", (long long)t);
         else
             printf("BAD\n");
